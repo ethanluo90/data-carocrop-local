@@ -1,0 +1,14 @@
+# Carousell Image Cropper
+# Install with: pip install -r requirements.txt
+
+# Core image processing
+pillow>=10.0.0
+pillow-heif>=1.1.0
+numpy>=1.24.0
+
+# Edge detection & contour finding
+opencv-python>=4.8.0
+
+# AI Saliency Detection (Fallback)
+rembg>=2.0.0
+onnxruntime>=1.15.0
