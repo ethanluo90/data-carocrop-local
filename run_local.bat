@@ -12,7 +12,7 @@ echo.
 echo Running cropper...
 echo.
 
-.\venv\Scripts\python processor.py
+.\venv\Scripts\python processor.py --compare
 
 echo.
 echo ============================================
@@ -20,5 +20,6 @@ echo   Processing Complete!
 echo ============================================
 echo.
 echo Output folder: output\
+echo Comparisons:   comparisons\
 echo.
 pause

@@ -6,9 +6,9 @@ pillow>=10.0.0
 pillow-heif>=1.1.0
 numpy>=1.24.0
 
-# Edge detection & contour finding
+# CV detection, Lab color space, morphology
 opencv-python>=4.8.0
 
-# AI Saliency Detection (Fallback)
+# AI-first saliency detection (U2-Net)
 rembg>=2.0.0
 onnxruntime>=1.15.0

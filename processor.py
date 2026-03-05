@@ -403,7 +403,11 @@ def filter_ai_components(
     platform_hint,
     required_center_hint,
 ):
-    """Drop side-touching AI contours that look like backdrop artifacts."""
+    """Drop side-touching AI contours that look like backdrop artifacts.
+    
+    Uses center-biased scoring: score = area * (1 - dist/max_dist)^2
+    with 0.3x penalty for edge-touching contours.
+    """
     import numpy as np
     import cv2
 
@@ -443,7 +447,14 @@ def filter_ai_components(
     }
 
     min_area = max(200.0, width * height * 0.0005)
-    side_margin = int(width * 0.05)
+    # Border margins: 5% extreme auto-drop, 8% side scoring zone
+    extreme_edge_x = int(width * 0.05)
+    extreme_edge_y = int(height * 0.05)
+    side_margin = int(width * 0.08)
+    top_margin = int(height * 0.05)
+    bottom_margin = int(height * 0.03)
+    max_dist = ((width / 2) ** 2 + (height / 2) ** 2) ** 0.5
+
     components = []
     kept = 0
     dropped = 0
@@ -459,7 +470,13 @@ def filter_ai_components(
         fill_ratio = area / max(1.0, float(w * h))
         aspect = max(w / max(1.0, h), h / max(1.0, w))
 
-        side_touch = (x <= side_margin) or (x + w >= width - side_margin)
+        # Edge touching checks (left/right AND top/bottom)
+        touch_left = x <= side_margin
+        touch_right = x + w >= width - side_margin
+        touch_top = y <= top_margin
+        touch_bottom = y + h >= height - bottom_margin
+        side_touch = touch_left or touch_right
+
         row_mask = np.zeros((height,), dtype=bool)
         y1 = max(0, y - int(h * 0.25))
         y2 = min(height, y + h + int(h * 0.25))
@@ -468,29 +485,46 @@ def filter_ai_components(
 
         contam = 0.0
         if side_touch:
-            contam = score_side_contamination(img, "left" if x <= side_margin else "right", x, x + w, row_mask, bg_ref)
+            contam = score_side_contamination(img, "left" if touch_left else "right", x, x + w, row_mask, bg_ref)
+
+        # --- CENTER-BIASED COMPOSITE SCORE ---
+        # score = area * (1 - dist/max_dist)^2, penalize edge-touching
+        proximity = max(0.0, 1.0 - dist / max_dist)
+        score = area * (proximity ** 2)
+        
+        # Penalize edge-touching contours
+        any_edge_touch = touch_left or touch_right or touch_top or touch_bottom
+        if any_edge_touch:
+            score *= 0.3
+
+        # --- DROP LOGIC ---
+        # 1. Auto-drop: contours touching extreme outer 5% of any edge
+        is_extreme_edge = (
+            (x <= extreme_edge_x) or
+            (x + w >= width - extreme_edge_x) or
+            (y <= extreme_edge_y) or
+            (y + h >= height - extreme_edge_y)
+        )
 
         shape_bad = (aspect > 5.5 and fill_ratio < 0.25) or (fill_ratio < 0.12)
         smallish = area < (width * height * 0.03)
         far_from_center = dist > (min(width, height) * 0.32)
         
-        # EXPLICIT EDGE ARTIFACT FILTER
-        # Check if the component touches the extreme outer 2% of the left or right edges
-        extreme_edge = int(width * 0.02)
-        is_extreme_edge_artifact = (x <= extreme_edge) or (x + w >= width - extreme_edge)
-        
-        should_drop = is_extreme_edge_artifact or (side_touch and smallish and contam > 0.26 and (shape_bad or far_from_center))
+        should_drop = (
+            is_extreme_edge or
+            (side_touch and smallish and contam > 0.26 and (shape_bad or far_from_center))
+        )
 
         if should_drop:
             dropped += 1
             print(
-                f"     [AI-COMPONENT] dropped side artifact at ({x},{y}) "
-                f"{w}x{h}, score={contam:.3f}, fill={fill_ratio:.3f}, aspect={aspect:.2f}"
+                f"     [AI-COMPONENT] dropped artifact at ({x},{y}) "
+                f"{w}x{h}, score={score:.0f}, contam={contam:.3f}, fill={fill_ratio:.3f}"
             )
             continue
 
         kept += 1
-        components.append((x, y, w, h, area, dist))
+        components.append((x, y, w, h, area, dist, score))
 
     print(f"     [AI-COMPONENT] kept={kept} dropped={dropped}")
     return components
@@ -524,8 +558,8 @@ def get_ai_crop_bounds(image: Image.Image) -> Optional[Tuple[int, int, int, int]
             required_center_hint=(center_x, center_y),
         )
 
-        # Pick central/main object then merge nearby fragments.
-        seed = min(components, key=lambda c: c[5] - (c[4] ** 0.5))
+        # Pick seed by highest composite score (center-biased, area-weighted).
+        seed = max(components, key=lambda c: c[6])
         seed_cx = seed[0] + seed[2] // 2
         seed_cy = seed[1] + seed[3] // 2
         max_cluster_dist = min(img_w, img_h) * 0.35
@@ -563,21 +597,32 @@ def get_ai_crop_bounds(image: Image.Image) -> Optional[Tuple[int, int, int, int]
 
 
 def get_cv_crop_bounds(image: Image.Image) -> Optional[Tuple[int, int, int, int]]:
-    """Fallback CV detector. Returns bounds as (x, y, w, h)."""
+    """Fallback CV detector using Lab-based foreground masking.
+    
+    Converts to Lab, thresholds on L channel using Otsu,
+    applies morphology cleanup, then scores contours by
+    center proximity and area.
+    """
     import numpy as np
     import cv2
 
     img = np.array(image.convert('RGB'))
     height, width = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    contrast_level = np.std(gray)
-    canny_low, canny_high = (20, 80) if contrast_level < 40 else (50, 150)
-    edges = cv2.Canny(blurred, canny_low, canny_high)
-    kernel = np.ones((5, 5), np.uint8)
-    dilated = cv2.dilate(edges, kernel, iterations=2)
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Lab-based foreground mask (more stable than Canny on light backgrounds)
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l_channel = lab[:, :, 0]
+    blurred_l = cv2.GaussianBlur(l_channel, (5, 5), 0)
+    
+    # Otsu threshold on L channel (separates dark product from bright backdrop)
+    _, mask = cv2.threshold(blurred_l, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Morphology: close (fill gaps in product), then open (remove noise specks)
+    kernel = np.ones((7, 7), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
         print('     [AI-FIRST] CV fallback found no contours')
@@ -585,11 +630,11 @@ def get_cv_crop_bounds(image: Image.Image) -> Optional[Tuple[int, int, int, int]
 
     center_x = width // 2
     center_y = height // 2
-    center_margin_x = int(width * 0.25)
-    center_margin_y = int(height * 0.15)
-    edge_margin_x = int(width * 0.05)
-    edge_margin_y = int(height * 0.03)
+    # Wider edge margins matching the light-box strategy
+    edge_margin_x = int(width * 0.08)
+    edge_margin_y = int(height * 0.05)
     min_area = (width * height) * 0.001
+    max_dist = ((width / 2) ** 2 + (height / 2) ** 2) ** 0.5
 
     valid_contours = []
     for contour in contours:
@@ -599,6 +644,7 @@ def get_cv_crop_bounds(image: Image.Image) -> Optional[Tuple[int, int, int, int]
         if area < min_area or w < 30 or h < 30:
             continue
 
+        # Auto-drop contours touching outer edge margins
         touching_edge = (
             x <= edge_margin_x
             or y <= edge_margin_y
@@ -610,18 +656,19 @@ def get_cv_crop_bounds(image: Image.Image) -> Optional[Tuple[int, int, int, int]
 
         cx = x + w // 2
         cy = y + h // 2
-        in_center_x = center_margin_x < cx < (width - center_margin_x)
-        in_center_y = center_margin_y < cy < (height - center_margin_y)
-
-        if in_center_x and in_center_y:
-            dist = ((cx - center_x) ** 2 + (cy - center_y) ** 2) ** 0.5
-            valid_contours.append((x, y, w, h, area, dist))
+        dist = ((cx - center_x) ** 2 + (cy - center_y) ** 2) ** 0.5
+        
+        # Center-biased composite score
+        proximity = max(0.0, 1.0 - dist / max_dist)
+        score = area * (proximity ** 2)
+        valid_contours.append((x, y, w, h, area, dist, score))
 
     if not valid_contours:
         print('     [AI-FIRST] CV fallback had only edge/noise contours')
         return None
 
-    valid_contours.sort(key=lambda c: c[5])
+    # Sort by composite score (highest = most central + largest)
+    valid_contours.sort(key=lambda c: c[6], reverse=True)
     main = valid_contours[0]
     cluster_center_x = main[0] + main[2] // 2
     cluster_center_y = main[1] + main[3] // 2
@@ -964,9 +1011,18 @@ def solve_square_crop(
         height,
     )
 
+
     square_size = max(req_right - req_left, req_bottom - req_top)
     if square_size < 2:
         square_size = min(width, height)
+
+    # GLOBAL MINIMUM SQUARE FLOOR: ensure consistent zoom regardless of detection size.
+    # When U2-Net misses low-contrast parts (e.g. white band on white background),
+    # the detected bounds are too small. This floor prevents over-zoom.
+    min_square = int(min(width, height) * 0.50)
+    if square_size < min_square:
+        print(f"     [CROP-SOLVER] Boosting square {square_size}px → {min_square}px (50% floor)")
+        square_size = min_square
 
     if platform_bounds is None:
         platform_bounds = (0, 0, width, height)
@@ -1036,11 +1092,20 @@ def solve_square_crop(
     )
     
     # Priority 1: Full product in frame (never cut off if geometrically possible).
-    # We must NOT reduce square_size to fit the platform. We must use the full square_size.
     # Center the square on the required bounds' center.
     base_left, base_top, base_right, base_bottom = _clip_ltrb(required_bounds, width, height)
     req_cx = (base_left + base_right) // 2
     req_cy = (base_top + base_bottom) // 2
+    
+    # Proportional shrink: cap to platform's smallest dimension
+    # to prevent gray edges, but use 85% relative cap for consistency.
+    plat_w = plat_right - plat_left
+    plat_h = plat_bottom - plat_top
+    max_legal_square = max(min(plat_w, plat_h), int(square_size * 0.85))
+    
+    if square_size > max_legal_square and max_legal_square > 0:
+        print(f"     [CROP-SOLVER] Shrinking {square_size}px → {max_legal_square}px (85% relative cap)")
+        square_size = max_legal_square
     
     half = square_size // 2
     crop_left = req_cx - half
@@ -1069,6 +1134,91 @@ def solve_square_crop(
         
     print(f"     [CROP-SOLVER] Full-image fallback square {square_size} at ({crop_left},{crop_top})")
     return crop_left, crop_top, crop_right, crop_bottom
+
+
+def border_contamination(strip, bg_ref=(255, 255, 255), dark_thresh=40):
+    """Score a border strip for non-white contamination (0.0 = clean, 1.0 = dirty)."""
+    import numpy as np
+    arr = np.asarray(strip, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[:, :, np.newaxis]
+    diff = np.abs(arr - np.array(bg_ref, dtype=np.float32))
+    max_diff = np.max(diff, axis=2)
+    dirty = max_diff > dark_thresh
+    return float(np.mean(dirty))
+
+
+def cleanup_crop_borders(cropped: Image.Image, threshold: float = 0.15) -> Image.Image:
+    """Post-crop border cleanup: scan 4 border strips + 4 corners for contamination and trim."""
+    import numpy as np
+    w, h = cropped.size
+    if w < 100 or h < 100:
+        return cropped
+
+    img = np.array(cropped.convert('RGB'))
+    strip_w = max(4, int(w * 0.08))
+    strip_h = max(4, int(h * 0.08))
+
+    left_strip = img[:, :strip_w, :]
+    right_strip = img[:, w-strip_w:, :]
+    top_strip = img[:strip_h, :, :]
+    bottom_strip = img[h-strip_h:, :, :]
+
+    l_score = border_contamination(left_strip)
+    r_score = border_contamination(right_strip)
+    t_score = border_contamination(top_strip)
+    b_score = border_contamination(bottom_strip)
+
+    trim_left = strip_w if l_score > threshold else 0
+    trim_right = strip_w if r_score > threshold else 0
+    trim_top = strip_h if t_score > threshold else 0
+    trim_bottom = strip_h if b_score > threshold else 0
+
+    # Corner scan: 4 quadrants scored independently
+    corner_w = max(4, int(w * 0.12))
+    corner_h = max(4, int(h * 0.12))
+    tl_corner = img[:corner_h, :corner_w, :]
+    tr_corner = img[:corner_h, w-corner_w:, :]
+    bl_corner = img[h-corner_h:, :corner_w, :]
+    br_corner = img[h-corner_h:, w-corner_w:, :]
+
+    tl_score = border_contamination(tl_corner)
+    tr_score = border_contamination(tr_corner)
+    bl_score = border_contamination(bl_corner)
+    br_score = border_contamination(br_corner)
+
+    corner_trim_left = corner_w if (tl_score > threshold or bl_score > threshold) else 0
+    corner_trim_right = corner_w if (tr_score > threshold or br_score > threshold) else 0
+    corner_trim_top = corner_h if (tl_score > threshold or tr_score > threshold) else 0
+    corner_trim_bottom = corner_h if (bl_score > threshold or br_score > threshold) else 0
+
+    trim_left = max(trim_left, corner_trim_left)
+    trim_right = max(trim_right, corner_trim_right)
+    trim_top = max(trim_top, corner_trim_top)
+    trim_bottom = max(trim_bottom, corner_trim_bottom)
+
+    if trim_left == 0 and trim_right == 0 and trim_top == 0 and trim_bottom == 0:
+        return cropped
+
+    total_trim = max(trim_left, trim_right, trim_top, trim_bottom)
+    max_trim = int(min(w, h) * 0.06)
+    total_trim = min(total_trim, max_trim)
+
+    new_left = total_trim
+    new_top = total_trim
+    new_right = w - total_trim
+    new_bottom = h - total_trim
+
+    if new_right - new_left < int(w * 0.80) or new_bottom - new_top < int(h * 0.80):
+        print(f"     [BORDER-CLEANUP] Skipped (trim too aggressive: {total_trim}px)")
+        return cropped
+
+    print(
+        f"     [BORDER-CLEANUP] Trimming {total_trim}px symmetrically "
+        f"(scores L={l_score:.2f} R={r_score:.2f} T={t_score:.2f} B={b_score:.2f}, "
+        f"corners TL={tl_score:.2f} TR={tr_score:.2f} BL={bl_score:.2f} BR={br_score:.2f})"
+    )
+    return cropped.crop((new_left, new_top, new_right, new_bottom))
 
 
 def tight_crop_to_object(image: Image.Image, padding_percent: float = DEFAULT_PADDING_PCT) -> Image.Image:
@@ -1118,7 +1268,8 @@ def tight_crop_to_object(image: Image.Image, padding_percent: float = DEFAULT_PA
         f'     [CROP-SOLVER] Final crop ({crop_left},{crop_top}) to '
         f'({crop_right},{crop_bottom}), size={square_size}x{square_size}'
     )
-    return image.crop((crop_left, crop_top, crop_right, crop_bottom))
+    cropped = image.crop((crop_left, crop_top, crop_right, crop_bottom))
+    return cleanup_crop_borders(cropped)
 
 
 def resize_to_target(image: Image.Image, target_size: int = TARGET_SIZE) -> Image.Image:
@@ -1192,6 +1343,69 @@ def process_image(input_path: Path, output_dir: Path) -> tuple:
         return (input_path, None, False)
 
 
+def generate_comparison(input_path: Path, output_path: Path, comparison_dir: Path) -> Optional[Path]:
+    """Generate a side-by-side comparison image (input left, output right)."""
+    try:
+        original = load_image(input_path)
+        processed = Image.open(output_path).convert('RGB')
+
+        target_h = 1080
+        orig_scale = target_h / original.height
+        orig_w = int(original.width * orig_scale)
+        original_resized = original.resize((orig_w, target_h), Image.LANCZOS)
+        proc_resized = processed.resize((target_h, target_h), Image.LANCZOS)
+
+        gap = 20
+        label_h = 40
+        canvas_w = orig_w + gap + target_h
+        canvas_h = target_h + label_h
+        canvas = Image.new('RGB', (canvas_w, canvas_h), (255, 255, 255))
+
+        canvas.paste(original_resized, (0, label_h))
+        canvas.paste(proc_resized, (orig_w + gap, label_h))
+
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(canvas)
+        try:
+            from PIL import ImageFont
+            font = ImageFont.truetype("arial.ttf", 24)
+        except Exception:
+            font = ImageFont.load_default()
+
+        draw.text((orig_w // 2 - 30, 8), "INPUT", fill=(100, 100, 100), font=font)
+        draw.text((orig_w + gap + target_h // 2 - 40, 8), "OUTPUT", fill=(0, 128, 0), font=font)
+        draw.line([(orig_w + gap // 2, label_h), (orig_w + gap // 2, canvas_h)], fill=(200, 200, 200), width=2)
+
+        comp_name = f"{input_path.stem}_comparison.png"
+        comp_path = comparison_dir / comp_name
+        canvas.save(comp_path, 'PNG')
+        return comp_path
+    except Exception as e:
+        print(f"  [COMPARE-ERROR] {input_path.name}: {e}")
+        return None
+
+
+def generate_all_comparisons(results: list, comparison_dir: Path):
+    """Generate side-by-side comparisons for all successful results."""
+    comparison_dir.mkdir(parents=True, exist_ok=True)
+    successful = [(inp, out) for inp, out, ok in results if ok and out is not None]
+
+    if not successful:
+        print("\n[COMPARE] No successful results to compare.")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"  GENERATING COMPARISONS ({len(successful)} images)")
+    print(f"{'='*60}")
+
+    for idx, (inp, out) in enumerate(successful, 1):
+        comp = generate_comparison(inp, out, comparison_dir)
+        if comp:
+            print(f"  [{idx}/{len(successful)}] {comp.name}")
+
+    print(f"\n  [DIR] Comparisons: {comparison_dir}")
+
+
 def main():
     """Main entry point."""
     import argparse
@@ -1199,6 +1413,7 @@ def main():
     parser = argparse.ArgumentParser(description='Carousell Image Cropper')
     parser.add_argument('--input', type=Path, help='Input directory')
     parser.add_argument('--output', type=Path, help='Output directory')
+    parser.add_argument('--compare', action='store_true', help='Generate side-by-side comparison images')
     args = parser.parse_args()
 
     print("\n" + "="*60)
@@ -1272,8 +1487,12 @@ def main():
     print("  Done! Images ready for Carousell upload.")
     print("="*60 + "\n")
     
-    # QC skipped in batch mode to prevent errors with nested structures
-    print("\n[INFO] Comparison generation skipped (Batch Mode)")
+    # Generate comparisons if requested
+    if args.compare:
+        comparison_dir = script_dir / "comparisons"
+        generate_all_comparisons(results, comparison_dir)
+    else:
+        print("\n[INFO] Run with --compare to generate side-by-side comparisons")
 
 
 if __name__ == "__main__":

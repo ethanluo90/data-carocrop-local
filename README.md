@@ -1,25 +1,28 @@
 # Carousell Image Cropper (Local)
 
-Automated image processing for Carousell listings with AI-first object detection, white-platform constrained crop, and 1080x1080 output.
+Automated image processing for Carousell listings with AI-first object detection, white-platform constrained crop, and 1080×1080 output.
 
-## Locked Rules and Features
+## Key Features
 
-1. **AI-First Detection** - U2-Net (`rembg`) is the primary detector for product bounds.
-2. **White Backdrop Only** - Crop is constrained to detected white platform area and trimmed away from gray side edges.
-3. **Yellow Logo Inclusion (Compulsory)** - If yellow mascot/logo is detected, it is always included in crop bounds.
-4. **Smart Square Crop** - Final output is always 1:1 (1080x1080).
-5. **Priority-Based Cropping**
-   - Priority 1: Full product in frame (never cut off if geometrically possible).
-   - Priority 2: Maximum coverage (smallest valid square containing required bounds).
-6. **Adaptive Enhancement** - Dynamic brightness/contrast/sharpness based on image analysis.
-7. **Backdrop Brightening** - Selective backdrop brightening while preserving product colors.
-8. **Recursive Scanning** - Processes all supported images in subfolders.
-9. **HEIC Support** - iPhone HEIC/HEIF support via `pillow-heif`.
+1. **AI-First Detection** — U2-Net (`rembg`) is the primary detector for product bounds.
+2. **Lab-Based CV Fallback** — Lab L-channel + Otsu thresholding + morphology for robust segmentation when AI fails.
+3. **Light-Box Strategy** — Border margin exclusion (5% extreme, 8% side) with center-biased contour scoring to prevent edge artifacts from light-box seams/panels.
+4. **White Platform Constraint** — Crop is constrained to the detected white platform area, trimmed away from gray side edges.
+5. **Yellow Logo Inclusion** — If yellow mascot/logo is detected, it is always included in crop bounds.
+6. **Smart Square Crop** — Final output is always 1:1 (1080×1080) with priority: full product in frame > maximum coverage.
+7. **Adaptive Enhancement** — Dynamic brightness/contrast/sharpness based on image analysis.
+8. **Backdrop Brightening** — Selective backdrop brightening while preserving product colors.
+9. **Border Cleanup** — Post-crop symmetrical trimming of residual dark/contaminated edges.
+10. **Comparison Mode** — Side-by-side input/output images for visual QC (`--compare`).
+11. **Recursive Scanning** — Processes all supported images in subfolders.
+12. **HEIC Support** — iPhone HEIC/HEIF support via `pillow-heif`.
 
 ## Processing Pipeline
 
 ```text
-Load -> AI-First Detection -> (CV Fallback if needed) -> White Platform Detection -> Compulsory Logo Merge -> Priority Square Solve -> Crop -> Backdrop Brighten -> Adaptive Enhance -> Resize 1080x1080 -> Save
+Load → AI Detection (U2-Net) → [Lab-based CV Fallback] → Filter AI Components
+→ White Platform Detection → Logo Merge → Square Crop Solve → Border Cleanup
+→ Backdrop Brighten → Adaptive Enhance → Resize 1080×1080 → Save
 ```
 
 ## Quick Start
@@ -33,40 +36,54 @@ run_local.bat
 
 ```text
 data-carocrop-local/
-|-- input/          # Raw photos (JPG, JPEG, PNG, WebP, HEIC, HEIF)
-|-- output/         # Processed outputs (1080x1080 PNG)
-|-- comparisons/    # Optional QC comparisons
-|-- processor.py    # Main processing pipeline
-|-- image_qc.py     # Quality control helper
-|-- run_local.bat   # Local batch launcher
-|-- requirements.txt
+├── input/           # Raw photos (JPG, JPEG, PNG, WebP, HEIC, HEIF)
+├── output/          # Processed outputs (1080×1080 PNG)
+├── comparisons/     # Side-by-side QC comparisons (when --compare used)
+├── processor.py     # Main processing pipeline
+├── run_local.bat    # Local batch launcher (with --compare)
+├── requirements.txt # Python dependencies
+└── MM Watermark.png # Watermark asset
 ```
 
 ## CLI Usage
 
 ```powershell
-python processor.py --input "C:\path\to\input" --output "C:\path\to\output"
+python processor.py [--input PATH] [--output PATH] [--compare]
 ```
 
-- `--input` and `--output` are optional.
-- If omitted, defaults are `./input` and `./output`.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input` | `./input` | Input folder with raw photos |
+| `--output` | `./output` | Output folder for processed images |
+| `--compare` | off | Generate side-by-side comparisons in `comparisons/` |
 
 ## Output Specification
 
-- Format: `PNG`
-- Size: `1080x1080`
-- Aspect Ratio: `1:1`
-- Filename: `{original}_caro.png`
+| Property | Value |
+|----------|-------|
+| Format | PNG |
+| Size | 1080×1080 |
+| Aspect Ratio | 1:1 |
+| Filename | `{original}_caro.png` |
+
+## Cropping Rules
+
+- **Full product in frame** — never cut off if geometrically possible.
+- **Edge artifacts always trimmed** — even if they clip the product edges.
+- **Yellow logo included** — always merged into required bounds when detected.
+- **Minimum zoom floor** — crop is at least 50% of the image's shorter dimension to prevent over-zoom on low-contrast products.
 
 ## Logging Tags
 
-`processor.py` emits structured tags for troubleshooting:
-
-- `[AI-FIRST]` - AI detection and CV fallback status
-- `[PLATFORM]` - detected white-platform bounds
-- `[LOGO]` - yellow mascot/logo detection
-- `[CROP-SOLVER]` - crop solve decisions
-- `[CONSTRAINT-CONFLICT]` - conflict between required bounds and platform constraints
+| Tag | Description |
+|-----|-------------|
+| `[AI-FIRST]` | AI detection and CV fallback status |
+| `[AI-COMPONENT]` | Component filtering (kept/dropped with scores) |
+| `[PLATFORM]` | Detected white-platform bounds |
+| `[LOGO]` | Yellow mascot/logo detection |
+| `[CROP-SOLVER]` | Crop solve decisions and square sizing |
+| `[BORDER-CLEANUP]` | Post-crop edge trimming results |
+| `[CONSTRAINT-CONFLICT]` | Conflict between required bounds and platform |
 
 ## Installation
 
@@ -78,14 +95,11 @@ pip install -r requirements.txt
 
 ## Dependencies
 
-- `pillow`
-- `pillow-heif`
-- `numpy`
-- `opencv-python`
-- `rembg`
-- `onnxruntime`
-
-## Notes
-
-- If product+logo cannot fully fit in platform-constrained area, solver falls back to full-image square constraints and logs `[CONSTRAINT-CONFLICT]`.
-- Quality checks can be run separately with `image_qc.py`.
+| Package | Purpose |
+|---------|---------|
+| `pillow` | Image processing |
+| `pillow-heif` | HEIC/HEIF support |
+| `numpy` | Array operations |
+| `opencv-python` | CV detection, Lab color space, morphology |
+| `rembg` | AI saliency detection (U2-Net) |
+| `onnxruntime` | ONNX model runtime for rembg |
