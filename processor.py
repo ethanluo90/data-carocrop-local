@@ -21,7 +21,7 @@ pillow_heif.register_heif_opener()
 TARGET_SIZE = 1080  # 1080x1080px square
 PLATFORM_X_TRIM_PCT = 0.05
 PLATFORM_Y_TRIM_PCT = 0.03
-DEFAULT_PADDING_PCT = 0.04
+DEFAULT_PADDING_PCT = 0.06
 YELLOW_MIN_AREA = 350
 EDGE_CLEAN_SCAN_PCT = 0.20
 EDGE_CLEAN_WINDOW = 24
@@ -29,6 +29,8 @@ EDGE_NONWHITE_MAX_RATIO = 0.08
 EDGE_CLEAN_STABILITY_WINDOWS = 3
 EDGE_CLEAN_PRODUCT_GUARD_PCT = 0.02
 ABSOLUTE_CLEAN_MARGIN_PCT = 0.08
+AI_MASK_DILATE_PX = 3  # Dilation kernel radius applied to AI mask before contour extraction
+PADDING_ARTIFACT_THRESHOLD = 0.50  # Max contamination score before padding is reduced on a side
 
 
 def load_image(image_path: Path) -> Image.Image:
@@ -542,7 +544,17 @@ def get_ai_crop_bounds(image: Image.Image) -> Optional[Tuple[int, int, int, int]
 
         result = remove(image, alpha_matting=False)
         alpha = np.array(result)[:, :, 3]
-        _, mask = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
+        _, mask = cv2.threshold(alpha, 20, 255, cv2.THRESH_BINARY)
+
+        # Dilate mask to fuse fragile edges before contour extraction.
+        # Prevents thin device boundaries from fragmenting into small
+        # contours that get dropped by filter_ai_components().
+        dilate_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (AI_MASK_DILATE_PX * 2 + 1, AI_MASK_DILATE_PX * 2 + 1),
+        )
+        mask = cv2.dilate(mask, dilate_kernel, iterations=1)
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
@@ -621,7 +633,14 @@ def get_cv_crop_bounds(image: Image.Image) -> Optional[Tuple[int, int, int, int]
     kernel = np.ones((7, 7), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    
+
+    # Dilate mask for consistency with AI path — fuse fragile edges
+    dilate_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (AI_MASK_DILATE_PX * 2 + 1, AI_MASK_DILATE_PX * 2 + 1),
+    )
+    mask = cv2.dilate(mask, dilate_kernel, iterations=1)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
@@ -998,15 +1017,71 @@ def solve_square_crop(
     1) Keep full required bounds in frame.
     2) Use smallest valid square (max fill).
     """
+    import numpy as np
+
     width, height = image_size
     req_left, req_top, req_right, req_bottom = _clip_ltrb(required_bounds, width, height)
 
+    # --- Artifact-aware per-side padding ---
+    # Check each expansion direction for contamination before applying padding.
+    # If a side has artifacts (paper edge, sticker, backdrop), reduce padding there.
     req_w = req_right - req_left
     req_h = req_bottom - req_top
-    pad_x = int(req_w * padding_percent)
-    pad_y = int(req_h * padding_percent)
+    pad_left = int(req_w * padding_percent)
+    pad_right = int(req_w * padding_percent)
+    pad_top = int(req_h * padding_percent)
+    pad_bottom = int(req_h * padding_percent)
+
+    if source_image is not None:
+        img_arr = np.array(source_image.convert('RGB'))
+        # Sample actual backdrop color so shadows on off-white don't false-trigger
+        bg_color = sample_backdrop_color(source_image)
+
+        # Probe the OUTER half of each padding zone (skip inner half which has
+        # device shadow / edge bleed that is normal, not an artifact).
+        def _probe_score(strip_arr):
+            if strip_arr.size == 0:
+                return 0.0
+            return border_contamination(strip_arr, bg_ref=bg_color, dark_thresh=55)
+
+        # Left side probe — outer half only
+        outer_l = max(0, req_left - pad_left)
+        inner_l = max(0, req_left - pad_left // 2)
+        strip = img_arr[req_top:req_bottom, outer_l:inner_l, :]
+        score_l = _probe_score(strip)
+        if score_l > PADDING_ARTIFACT_THRESHOLD:
+            pad_left = pad_left // 2
+            print(f"     [PAD-GUARD] Left artifact (score={score_l:.2f}), padding halved to {pad_left}px")
+
+        # Right side probe — outer half only
+        inner_r = min(width, req_right + pad_right // 2)
+        outer_r = min(width, req_right + pad_right)
+        strip = img_arr[req_top:req_bottom, inner_r:outer_r, :]
+        score_r = _probe_score(strip)
+        if score_r > PADDING_ARTIFACT_THRESHOLD:
+            pad_right = pad_right // 2
+            print(f"     [PAD-GUARD] Right artifact (score={score_r:.2f}), padding halved to {pad_right}px")
+
+        # Top side probe — outer half only
+        outer_t = max(0, req_top - pad_top)
+        inner_t = max(0, req_top - pad_top // 2)
+        strip = img_arr[outer_t:inner_t, req_left:req_right, :]
+        score_t = _probe_score(strip)
+        if score_t > PADDING_ARTIFACT_THRESHOLD:
+            pad_top = pad_top // 2
+            print(f"     [PAD-GUARD] Top artifact (score={score_t:.2f}), padding halved to {pad_top}px")
+
+        # Bottom side probe — outer half only
+        inner_b = min(height, req_bottom + pad_bottom // 2)
+        outer_b = min(height, req_bottom + pad_bottom)
+        strip = img_arr[inner_b:outer_b, req_left:req_right, :]
+        score_b = _probe_score(strip)
+        if score_b > PADDING_ARTIFACT_THRESHOLD:
+            pad_bottom = pad_bottom // 2
+            print(f"     [PAD-GUARD] Bottom artifact (score={score_b:.2f}), padding halved to {pad_bottom}px")
+
     req_left, req_top, req_right, req_bottom = _clip_ltrb(
-        (req_left - pad_x, req_top - pad_y, req_right + pad_x, req_bottom + pad_y),
+        (req_left - pad_left, req_top - pad_top, req_right + pad_right, req_bottom + pad_bottom),
         width,
         height,
     )
@@ -1201,7 +1276,9 @@ def cleanup_crop_borders(cropped: Image.Image, threshold: float = 0.15) -> Image
         return cropped
 
     total_trim = max(trim_left, trim_right, trim_top, trim_bottom)
-    max_trim = int(min(w, h) * 0.06)
+    # Cap trim to preserve the intended padding zone.
+    # Allow at most 2% trim — must not eat the 6% padding.
+    max_trim = max(1, int(min(w, h) * 0.02))
     total_trim = min(total_trim, max_trim)
 
     new_left = total_trim
