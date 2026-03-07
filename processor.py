@@ -7,6 +7,7 @@ Crops images to Singapore Carousell marketplace standard:
 - Center-crop (no background removal)
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -31,6 +32,82 @@ EDGE_CLEAN_PRODUCT_GUARD_PCT = 0.02
 ABSOLUTE_CLEAN_MARGIN_PCT = 0.08
 AI_MASK_DILATE_PX = 3  # Dilation kernel radius applied to AI mask before contour extraction
 PADDING_ARTIFACT_THRESHOLD = 0.50  # Max contamination score before padding is reduced on a side
+BACKDROP_TARGET_BRIGHTNESS = 240
+BACKDROP_FEATHER_PX = 32
+BACKDROP_FEATHER_SIGMA = 5.0
+BACKDROP_MAX_LIFT = 45.0
+BACKDROP_EDGE_MIN_STRENGTH = 0.72
+BACKDROP_SHADOW_NEAR_PX = 180.0
+BACKDROP_SHADOW_EXTRA_LIFT = 26.0
+BACKDROP_FAR_REF_DIST_PX = 120.0
+ENABLE_BACKDROP_NORMALIZATION = False
+GLOBAL_BRIGHTNESS = 1.16
+ENABLE_ADAPTIVE_BRIGHTNESS_TARGET = True
+ADAPTIVE_BRIGHTNESS_TARGET_LUMA = 206.0
+ADAPTIVE_BRIGHTNESS_STRENGTH = 0.65
+ADAPTIVE_BRIGHTNESS_MIN = 1.08
+ADAPTIVE_BRIGHTNESS_MAX = 1.24
+ENABLE_ANTI_GRAY_CORRECTION = True
+WHITE_POINT_PERCENTILE = 99.0
+WHITE_POINT_TARGET_LUMA = 248.0
+WHITE_POINT_MAX_GAIN = 1.06
+GLOBAL_COLOR_BOOST = 1.07
+
+# Global rembg session — loaded once, reused for every image in the batch.
+_rembg_session = None
+
+
+def _get_rembg_session():
+    """Return a cached rembg session (loads U2-Net model on first call).
+
+    Checks for a bundled u2net.onnx next to the executable first,
+    so compiled distributions work offline without downloading.
+    """
+    global _rembg_session
+    if _rembg_session is None:
+        import os
+
+        # Point rembg model cache to a local folder so a bundled
+        # u2net.onnx is found automatically (no internet needed).
+        # Nuitka onefile: sys.executable is temp dir, sys.argv[0] is real exe.
+        script_dir = str(Path(__file__).parent)
+        if "__compiled__" in globals() or getattr(sys, 'frozen', False):
+            exe_dir = str(Path(os.path.abspath(sys.argv[0])).parent)
+        else:
+            exe_dir = script_dir
+
+        # Stabilize numba cache path to avoid temp-file stalls in onefile runs.
+        numba_cache_dir = os.path.join(exe_dir, '.numba_cache')
+        try:
+            os.makedirs(numba_cache_dir, exist_ok=True)
+            os.environ.setdefault('NUMBA_CACHE_DIR', numba_cache_dir)
+        except Exception:
+            pass
+        # Reduce native runtime pressure in compiled onefile mode.
+        os.environ.setdefault('OMP_NUM_THREADS', '1')
+        os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+        os.environ.setdefault('MKL_NUM_THREADS', '1')
+        os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+        os.environ.setdefault('OMP_WAIT_POLICY', 'PASSIVE')
+        os.environ.setdefault('NUMBA_DISABLE_JIT', '1')
+        os.environ.setdefault('NUMBA_DISABLE_CUDA', '1')
+
+        from rembg import new_session
+        for candidate in [exe_dir, script_dir]:
+            bundled_model = os.path.join(candidate, '.u2net', 'u2net.onnx')
+            if os.path.isfile(bundled_model):
+                os.environ['U2NET_HOME'] = os.path.join(candidate, '.u2net')
+                break
+
+        print("")
+        print("  ========================================")
+        print("  Loading AI model... (first image only)")
+        print("  This may take a moment.")
+        print("  ========================================")
+        _rembg_session = new_session("u2net")
+        print("  [AI] Model loaded and ready!")
+        print("")
+    return _rembg_session
 
 
 def load_image(image_path: Path) -> Image.Image:
@@ -97,80 +174,110 @@ def sample_backdrop_color(image: Image.Image) -> tuple:
     return tuple(median_color)
 
 
-def brighten_backdrop(image: Image.Image, brightness_boost: float = 1.2) -> Image.Image:
+def brighten_backdrop(
+    image: Image.Image,
+    target_brightness: int = BACKDROP_TARGET_BRIGHTNESS,
+) -> Image.Image:
     """
-    Selectively brighten only the backdrop area while preserving product colors.
-    
-    Uses edge detection and contour finding to create a mask separating product
-    from backdrop, then applies brightness boost only to backdrop pixels.
-    
+    Normalize backdrop to a consistent target brightness using the AI (rembg) mask.
+
+    Instead of multiplying by a variable factor, this maps backdrop pixels toward
+    a fixed target value so every output has the same backdrop brightness regardless
+    of input lighting.
+
     Args:
         image: Input image (already cropped)
-        brightness_boost: Brightness multiplier for backdrop (1.0 = no change)
-    
+        target_brightness: Desired average backdrop brightness (0-255)
+
     Returns:
-        Image with brightened backdrop and original product
+        Image with normalized backdrop and original product
     """
     import numpy as np
     import cv2
-    
-    # Convert to numpy array
+    from rembg import remove
+
     img_array = np.array(image)
     height, width = img_array.shape[:2]
-    
-    # Convert to grayscale for edge detection
-    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    
-    # Edge detection
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-    
-    # Dilate to close gaps
-    kernel = np.ones((5, 5), np.uint8)
-    dilated = cv2.dilate(edges, kernel, iterations=2)
-    
-    # Find contours
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Create mask (0 = backdrop, 255 = product)
-    product_mask = np.zeros((height, width), dtype=np.uint8)
-    
-    if contours:
-        # Fill largest contour (product) with white
-        largest_contour = max(contours, key=cv2.contourArea)
-        cv2.drawContours(product_mask, [largest_contour], -1, 255, -1)
-    
-    # Invert mask (255 = backdrop, 0 = product)
+
+    # Use AI mask (rembg) for accurate product/backdrop separation
+    session = _get_rembg_session()
+    result_rgba = remove(image, alpha_matting=False, session=session)
+    alpha = np.array(result_rgba)[:, :, 3]
+
+    # Product mask: alpha > 128 is definitely product (conservative threshold)
+    _, product_core_mask = cv2.threshold(alpha, 128, 255, cv2.THRESH_BINARY)
+
+    # Also include semi-transparent zones (alpha 30-128) as product safety margin
+    _, semi_mask = cv2.threshold(alpha, 30, 255, cv2.THRESH_BINARY)
+    product_mask = cv2.bitwise_or(product_core_mask, semi_mask)
+
+    # Dilate product mask generously to protect edges from brightening bleed
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    product_mask = cv2.dilate(product_mask, dilate_kernel, iterations=1)
+
     backdrop_mask = cv2.bitwise_not(product_mask)
-    
-    # SOFT MASK: Apply Gaussian blur for smooth transition (eliminates visible border)
-    soft_mask = cv2.GaussianBlur(backdrop_mask.astype(np.float32), (51, 51), 0)
-    soft_mask = soft_mask / 255.0  # Normalize to 0-1 range
-    
-    # Measure backdrop brightness
-    backdrop_pixels = img_array[backdrop_mask > 0]
+    backdrop_binary = (backdrop_mask > 0).astype(np.uint8)
+
+    # Feathered correction mask from product edge into backdrop with Gaussian softening.
+    dist_to_product = cv2.distanceTransform(backdrop_binary, cv2.DIST_L2, 5)
+    feather_base = np.clip(dist_to_product / float(BACKDROP_FEATHER_PX), 0.0, 1.0).astype(np.float32)
+    feather_base = cv2.GaussianBlur(feather_base, (0, 0), BACKDROP_FEATHER_SIGMA)
+    feather_base = np.clip(feather_base, 0.0, 1.0)
+    correction_mask = (
+        BACKDROP_EDGE_MIN_STRENGTH + (1.0 - BACKDROP_EDGE_MIN_STRENGTH) * feather_base
+    ) * backdrop_binary.astype(np.float32)
+
+    # A wider near-product weight helps flatten large shadow rings around objects.
+    near_shadow_weight = np.exp(-np.square(dist_to_product / BACKDROP_SHADOW_NEAR_PX)).astype(np.float32)
+    near_shadow_weight = near_shadow_weight * backdrop_binary.astype(np.float32)
+
+    # Measure current backdrop brightness (grayscale proxy)
+    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    backdrop_pixels = gray[backdrop_mask > 0]
+    product_pixels = gray[product_core_mask > 0]
     if len(backdrop_pixels) > 0:
-        avg_backdrop_brightness = np.mean(backdrop_pixels)
-        
-        # Only brighten if backdrop is dark (< 200)
-        if avg_backdrop_brightness < 200:
-            # Apply brightness boost to entire image
-            brightened = np.clip(img_array * brightness_boost, 0, 255).astype(np.uint8)
-            
-            # Blend using SOFT mask (smooth transition, no visible border)
-            result = (brightened * soft_mask[:, :, np.newaxis] + 
-                      img_array * (1 - soft_mask[:, :, np.newaxis])).astype(np.uint8)
-            
-            print(f"     Backdrop brightened: avg={avg_backdrop_brightness:.1f} -> boost={brightness_boost:.2f}x")
+        avg_backdrop = float(np.mean(backdrop_pixels))
+
+        if avg_backdrop < target_brightness - 2:
+            # Lift Lab luminance only where backdrop exists, tapered by feather mask.
+            lab = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB).astype(np.float32)
+            l_channel = lab[:, :, 0]
+
+            # Base lift toward target brightness on full backdrop.
+            base_lift = np.clip(target_brightness - l_channel, 0.0, BACKDROP_MAX_LIFT) * correction_mask
+
+            # Shadow-ring suppression: use far backdrop as reference and lift nearby darker zones.
+            far_region = (backdrop_mask > 0) & (dist_to_product >= BACKDROP_FAR_REF_DIST_PX)
+            if np.count_nonzero(far_region) > 500:
+                far_ref = float(np.percentile(gray[far_region], 65))
+            else:
+                far_ref = max(avg_backdrop, float(target_brightness - 4))
+
+            shadow_deficit = np.clip(far_ref - gray, 0.0, BACKDROP_SHADOW_EXTRA_LIFT)
+            shadow_lift = shadow_deficit * near_shadow_weight
+
+            total_lift = np.maximum(base_lift, shadow_lift)
+            l_channel = l_channel + total_lift
+            lab[:, :, 0] = np.clip(l_channel, 0.0, 255.0)
+            result = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+            result_gray = cv2.cvtColor(result, cv2.COLOR_RGB2GRAY).astype(np.float32)
+            new_avg = float(np.mean(result_gray[backdrop_mask > 0]))
+            if len(product_pixels) > 0:
+                product_delta = float(np.mean(result_gray[product_core_mask > 0]) - np.mean(product_pixels))
+            else:
+                product_delta = 0.0
+            print(
+                f"     Backdrop normalized: avg={avg_backdrop:.1f} -> {new_avg:.1f} "
+                f"(target={target_brightness}, product_delta={product_delta:+.2f})"
+            )
         else:
-            # Backdrop already bright, no change
             result = img_array
-            print(f"     Backdrop already bright: avg={avg_backdrop_brightness:.1f}, no boost needed")
+            print(f"     Backdrop already bright: avg={avg_backdrop:.1f}, target={target_brightness}")
     else:
-        # No backdrop detected, return original
         result = img_array
         print(f"     No backdrop detected, skipping brightening")
-    
+
     return Image.fromarray(result)
 
 
@@ -187,67 +294,89 @@ def enhance_image(image: Image.Image, adaptive: bool = True) -> Image.Image:
     """
     import numpy as np
     import cv2
-    
+
+    img_array = np.array(image)
+    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+
+    # FIXED brightness — same for every image (consistency)
+    # Keep global brightness neutral; backdrop normalization handles lifting.
+    avg_luma = float(np.mean(gray))
+    brightness = GLOBAL_BRIGHTNESS
+
     if adaptive:
-        # Convert to numpy for analysis
-        img_array = np.array(image)
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        
-        # BRIGHTNESS ANALYSIS
-        # Measure average brightness (0-255)
-        brightness_avg = np.mean(gray)
-        
-        if brightness_avg < 100:           # Dark image
-            brightness = 1.35              # Brighten more
-        elif brightness_avg < 150:         # Medium dim image
-            brightness = 1.25              # Brighten moderately
-        elif brightness_avg > 200:         # Very bright image
-            brightness = 1.05              # Brighten less
-        else:                              # Normal brightness
-            brightness = 1.15              # Standard boost
-        
-        # CONTRAST ANALYSIS
-        # Measure contrast using standard deviation
+        if ENABLE_ADAPTIVE_BRIGHTNESS_TARGET:
+            # Nudge each image toward a target luminance, with tight clamp bounds.
+            raw_ratio = ADAPTIVE_BRIGHTNESS_TARGET_LUMA / max(avg_luma, 1.0)
+            adaptive_factor = 1.0 + ((raw_ratio - 1.0) * ADAPTIVE_BRIGHTNESS_STRENGTH)
+            brightness = float(
+                np.clip(
+                    GLOBAL_BRIGHTNESS * adaptive_factor,
+                    ADAPTIVE_BRIGHTNESS_MIN,
+                    ADAPTIVE_BRIGHTNESS_MAX,
+                )
+            )
+
+        # ADAPTIVE contrast
         contrast_level = np.std(gray)
-        
-        if contrast_level < 35:            # Low contrast (flat/washed out)
-            contrast = 1.25                # Boost more
-        elif contrast_level > 65:          # High contrast
-            contrast = 1.05                # Boost less
-        else:                              # Normal contrast
-            contrast = 1.15                # Standard boost
-        
-        # SHARPNESS ANALYSIS
-        # Detect sharpness using Laplacian variance
+        if contrast_level < 35:
+            contrast = 1.25
+        elif contrast_level > 65:
+            contrast = 1.05
+        else:
+            contrast = 1.15
+
+        # ADAPTIVE sharpness
         laplacian = cv2.Laplacian(gray, cv2.CV_64F)
         sharpness_score = laplacian.var()
-        
-        if sharpness_score < 100:          # Blurry image
-            sharpness = 1.5                # Sharpen more
-        elif sharpness_score > 500:        # Already sharp
-            sharpness = 1.1                # Sharpen less
-        else:                              # Normal sharpness
-            sharpness = 1.3                # Standard sharpen
-        
-        print(f"     Analysis: brightness={brightness_avg:.1f}, contrast={contrast_level:.1f}, sharpness={sharpness_score:.1f}")
+        if sharpness_score < 100:
+            sharpness = 1.5
+        elif sharpness_score > 500:
+            sharpness = 1.1
+        else:
+            sharpness = 1.3
+
+        print(
+            f"     Analysis: luma={avg_luma:.1f}, contrast={contrast_level:.1f}, "
+            f"sharpness={sharpness_score:.1f}"
+        )
     else:
-        # Fixed values (original behavior)
-        brightness = 1.15
         contrast = 1.05
         sharpness = 1.3
-    
-    # Apply enhancements
+
     enhancer = ImageEnhance.Brightness(image)
     enhanced = enhancer.enhance(brightness)
-    
+
     enhancer = ImageEnhance.Contrast(enhanced)
     enhanced = enhancer.enhance(contrast)
-    
+
     enhancer = ImageEnhance.Sharpness(enhanced)
     enhanced = enhancer.enhance(sharpness)
-    
-    print(f"     Enhanced: brightness={brightness:.2f}, contrast={contrast:.2f}, sharpness={sharpness:.2f}")
-    
+
+    white_gain = 1.0
+    if ENABLE_ANTI_GRAY_CORRECTION:
+        # Mild white-point lift to reduce gray cast without flattening the image.
+        enhanced_np = np.array(enhanced)
+        lab = cv2.cvtColor(enhanced_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+        l_channel = lab[:, :, 0]
+        white_ref = float(np.percentile(l_channel, WHITE_POINT_PERCENTILE))
+        if white_ref > 1.0:
+            white_gain = min(
+                WHITE_POINT_MAX_GAIN,
+                max(1.0, WHITE_POINT_TARGET_LUMA / white_ref),
+            )
+            if white_gain > 1.001:
+                lab[:, :, 0] = np.clip(l_channel * white_gain, 0.0, 255.0)
+                enhanced = Image.fromarray(cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB))
+
+        # Tiny saturation bump helps counter dull/gray output after lift.
+        color_enhancer = ImageEnhance.Color(enhanced)
+        enhanced = color_enhancer.enhance(GLOBAL_COLOR_BOOST)
+
+    print(
+        f"     Enhanced: brightness={brightness:.2f}, contrast={contrast:.2f}, "
+        f"sharpness={sharpness:.2f}, white_gain={white_gain:.3f}, color={GLOBAL_COLOR_BOOST:.2f}"
+    )
+
     return enhanced
 
 def extend_edges(image: Image.Image, extend_percent: float = 0.15) -> Image.Image:
@@ -511,10 +640,20 @@ def filter_ai_components(
         shape_bad = (aspect > 5.5 and fill_ratio < 0.25) or (fill_ratio < 0.12)
         smallish = area < (width * height * 0.03)
         far_from_center = dist > (min(width, height) * 0.32)
+        very_small = area < (width * height * 0.008)
+        peripheral = dist > (min(width, height) * 0.25)
+        # New tier: small-to-medium objects that are far away (logos, stickers, props)
+        small_medium = area < (width * height * 0.025)
+        distant = dist > (min(width, height) * 0.38)
         
         should_drop = (
             is_extreme_edge or
-            (side_touch and smallish and contam > 0.26 and (shape_bad or far_from_center))
+            (side_touch and smallish and contam > 0.26 and (shape_bad or far_from_center)) or
+            # Drop very small + peripheral (paper labels, case corners)
+            (very_small and peripheral and (shape_bad or fill_ratio < 0.35)) or
+            # Drop small-to-medium objects that are very far from center
+            # (logos, stickers, props at table edges)
+            (small_medium and distant)
         )
 
         if should_drop:
@@ -542,7 +681,8 @@ def get_ai_crop_bounds(image: Image.Image) -> Optional[Tuple[int, int, int, int]
         import numpy as np
         import cv2
 
-        result = remove(image, alpha_matting=False)
+        session = _get_rembg_session()
+        result = remove(image, alpha_matting=False, session=session)
         alpha = np.array(result)[:, :, 3]
         _, mask = cv2.threshold(alpha, 20, 255, cv2.THRESH_BINARY)
 
@@ -586,12 +726,16 @@ def get_ai_crop_bounds(image: Image.Image) -> Optional[Tuple[int, int, int, int]
             c_area = c[4]
             
             # MULTI-PART COMPONENT FILTER
-            # Keep if it is close to the seed AND/OR if it is a significant component
-            # (at least 0.5% size of seed OR >1.0% of total image area)
-            is_significant = (c_area >= seed_area * 0.005) or (c_area > total_img_area * 0.01)
-            
-            if dist <= max_cluster_dist or is_significant:
+            # Keep if close to seed. For distant components, require them to be
+            # large (>20% of seed) and reasonably close to be part of same product.
+            # This prevents logos, stickers, and other peripheral objects from
+            # pulling the crop bounds outward.
+            if dist <= max_cluster_dist:
                 cluster.append(c)
+            elif c_area >= seed_area * 0.20 and dist <= max_cluster_dist * 1.4:
+                # Large component relatively near — likely part of product (e.g. stylus)
+                cluster.append(c)
+                print(f"     [AI-FIRST] Including distant component area={c_area:.0f} dist={dist:.0f}")
 
         if not cluster:
             cluster = [seed]
@@ -1328,8 +1472,29 @@ def tight_crop_to_object(image: Image.Image, padding_percent: float = DEFAULT_PA
         print('     [AI-FIRST] Detector fallback to center box')
 
     product_ltrb = _clip_ltrb(product_ltrb, width, height)
+
+    # Detect yellow logo — only include if it's close to the product.
+    # Far-away logos (e.g. at table corners) are excluded.
     logo_ltrb = detect_yellow_logo_bounds(image, product_bounds=product_ltrb)
-    required_ltrb = product_ltrb if logo_ltrb is None else _union_ltrb(product_ltrb, logo_ltrb)
+    if logo_ltrb is not None:
+        p_left, p_top, p_right, p_bottom = product_ltrb
+        l_left, l_top, l_right, l_bottom = logo_ltrb
+        logo_cx = (l_left + l_right) / 2
+        logo_cy = (l_top + l_bottom) / 2
+        prod_cx = (p_left + p_right) / 2
+        prod_cy = (p_top + p_bottom) / 2
+        prod_diag = ((p_right - p_left) ** 2 + (p_bottom - p_top) ** 2) ** 0.5
+        logo_dist = ((logo_cx - prod_cx) ** 2 + (logo_cy - prod_cy) ** 2) ** 0.5
+        # Include logo only if within 60% of the product diagonal
+        if logo_dist <= prod_diag * 0.6:
+            required_ltrb = _union_ltrb(product_ltrb, logo_ltrb)
+            print(f'     [LOGO] Included (dist={logo_dist:.0f}, threshold={prod_diag*0.6:.0f})')
+        else:
+            print(f'     [LOGO] Excluded — too far from product (dist={logo_dist:.0f}, threshold={prod_diag*0.6:.0f})')
+            required_ltrb = product_ltrb
+    else:
+        required_ltrb = product_ltrb
+
     platform_ltrb = detect_white_platform_bounds(image, required_bounds=required_ltrb)
 
     crop_left, crop_top, crop_right, crop_bottom = solve_square_crop(
@@ -1373,6 +1538,44 @@ def apply_white_background(image: Image.Image) -> Image.Image:
     return white_bg
 
 
+def apply_watermark(image: Image.Image, watermark_path: Path) -> Image.Image:
+    """Overlay the MM watermark at the same position as the reference photo.
+
+    The watermark PNG content is NOT rescaled — native pixels are composited
+    directly.  Only the position is matched to the reference output.
+    """
+    if not watermark_path.exists():
+        print(f"     [WATERMARK] File not found: {watermark_path}")
+        return image
+
+    import numpy as np
+
+    wm = Image.open(watermark_path).convert('RGBA')
+
+    # Find the bounding box of non-transparent pixels (the actual logo)
+    alpha = np.array(wm)[:, :, 3]
+    rows = np.any(alpha > 0, axis=1)
+    cols = np.any(alpha > 0, axis=0)
+    y_min, y_max = int(np.where(rows)[0][0]), int(np.where(rows)[0][-1])
+    x_min, x_max = int(np.where(cols)[0][0]), int(np.where(cols)[0][-1])
+
+    # Crop to just the logo content (no resize)
+    logo = wm.crop((x_min, y_min, x_max + 1, y_max + 1))
+
+    # Target position: top-left corner matching reference (~2.5% margin)
+    img_w, img_h = image.size
+    pos_x = int(img_w * 0.025)
+    pos_y = int(img_h * 0.025)
+
+    # Composite onto the image
+    base = image.convert('RGBA')
+    base.paste(logo, (pos_x, pos_y), logo)
+    result = base.convert('RGB')
+
+    print(f"     Watermark applied: {logo.width}x{logo.height} at ({pos_x},{pos_y}) [native res]")
+    return result
+
+
 def process_image(input_path: Path, output_dir: Path) -> tuple:
     """Process a single image through the cropping pipeline."""
     print(f"\n{'='*50}")
@@ -1392,20 +1595,30 @@ def process_image(input_path: Path, output_dir: Path) -> tuple:
         cropped = tight_crop_to_object(original, padding_percent=0.04)
         print(f"     Output: {cropped.width}x{cropped.height}")
         
-        # Step 3: Brighten backdrop (if dark)
-        print("  -> Brightening backdrop...")
-        backdrop_brightened = brighten_backdrop(cropped, brightness_boost=1.2)
+        # Step 3: Optional localized backdrop normalization
+        if ENABLE_BACKDROP_NORMALIZATION:
+            print("  -> Normalizing backdrop...")
+            pre_enhance = brighten_backdrop(cropped, target_brightness=BACKDROP_TARGET_BRIGHTNESS)
+        else:
+            print("  -> Skipping localized backdrop normalization (global enhance mode)...")
+            pre_enhance = cropped
         
         # Step 4: Enhance image (adaptive sharpening and contrast)
         print("  -> Enhancing image...")
-        enhanced = enhance_image(backdrop_brightened)
+        enhanced = enhance_image(pre_enhance)
         
         # Step 5: Resize to target output
         print("  -> Resizing to 1080x1080...")
         final = resize_to_target(enhanced, target_size=TARGET_SIZE)
 
-        # Step 6: Save
-        output_filename = f"{input_path.stem}_caro.png"
+        # Step 6: Apply MM Watermark
+        watermark_path = _resolve_asset_path("MM Watermark.png")
+        if watermark_path is not None and watermark_path.exists():
+            print("  -> Applying MM watermark...")
+            final = apply_watermark(final, watermark_path)
+
+        # Step 7: Save
+        output_filename = f"{input_path.stem}.png"
         output_path = output_dir / output_filename
         
         print(f"  -> Saving: {output_path.name}")
@@ -1483,46 +1696,124 @@ def generate_all_comparisons(results: list, comparison_dir: Path):
     print(f"\n  [DIR] Comparisons: {comparison_dir}")
 
 
+def _resolve_exe_dir() -> Path:
+    """Return the directory where the executable (or script) lives.
+
+    Works for both normal Python execution and Nuitka-compiled binaries.
+    In Nuitka onefile mode, sys.executable points to a temp extraction
+    directory — sys.argv[0] always points to the real .exe on disk.
+    """
+    if "__compiled__" in globals() or getattr(sys, 'frozen', False):
+        return Path(os.path.abspath(sys.argv[0])).parent
+    return Path(__file__).parent
+
+
+def _resolve_asset_path(filename: str) -> Optional[Path]:
+    """Find asset next to exe first, then bundled temp path for onefile builds."""
+    exe_candidate = _resolve_exe_dir() / filename
+    if exe_candidate.exists():
+        return exe_candidate
+
+    script_candidate = Path(__file__).parent / filename
+    if script_candidate.exists():
+        return script_candidate
+
+    return None
+
+
+def _pause_exit(prompt: str = "  Press Enter to exit...") -> None:
+    """Pause if interactive, but never crash on missing stdin."""
+    try:
+        input(prompt)
+    except Exception:
+        pass
+
+
 def main():
     """Main entry point."""
     import argparse
     
     parser = argparse.ArgumentParser(description='Carousell Image Cropper')
-    parser.add_argument('--input', type=Path, help='Input directory')
-    parser.add_argument('--output', type=Path, help='Output directory')
-    parser.add_argument('--compare', action='store_true', help='Generate side-by-side comparison images')
+    parser.add_argument('input', nargs='?', type=Path, default=None,
+                        help='Input folder or image file (default: ./input)')
+    parser.add_argument('--output', type=Path, help='Output directory (default: ./output)')
     args = parser.parse_args()
 
     print("\n" + "="*60)
-    print("  CAROUSELL IMAGE CROPPER - BATCH DRIVE MODE")
-    print("  Recursive Scan & Structure Mirroring")
+    print("  MISTER MOBILE - CAROUSELL IMAGE CROPPER  v3.0.0")
+    print("  1080x1080 Square  |  AI Object Detection")
     print("="*60)
-    
-    # Setup paths
-    script_dir = Path(__file__).parent
-    input_dir = args.input if args.input else script_dir / "input"
-    output_dir = args.output if args.output else script_dir / "output"
-    
-    # Create directories
-    input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\n[DIR] Input:  {input_dir}")
-    print(f"[DIR] Output: {output_dir}")
-    
-    # Find images (Recursive)
+
+    exe_dir = _resolve_exe_dir()
     supported_formats = {'.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif'}
-    print("[SCAN] Scanning for images recursively...")
-    image_files = [f for f in input_dir.rglob('*') 
-                   if f.is_file() and f.suffix.lower() in supported_formats]
+
+    # ------------------------------------------------------------------
+    # Resolve INPUT — accepts a folder, a single image, or defaults to
+    # an interactive prompt so users can drag-and-drop paths.
+    # ------------------------------------------------------------------
+    input_path = args.input
+    if input_path is None:
+        # Interactive: ask user (works nicely in compiled .exe console)
+        print("\n  Drag & drop a folder or image here, then press Enter.")
+        print("  Or just press Enter to use the default ./input folder.")
+        raw = input("\n  Path: ").strip().strip('"').strip("'")
+        input_path = Path(raw) if raw else exe_dir / "input"
+
+    input_path = Path(input_path)
+
+    # Auto-create default input/output folders next to the exe
+    if not input_path.exists():
+        # Only auto-create if it's the default ./input folder
+        default_input = exe_dir / "input"
+        if input_path == default_input:
+            input_path.mkdir(parents=True, exist_ok=True)
+            print(f"\n  [INFO] Created input folder: {input_path}")
+            print("         Place your images there and run again.")
+            _pause_exit("\n  Press Enter to exit...")
+            sys.exit(0)
+        print(f"\n  [ERROR] Path not found: {input_path}")
+        _pause_exit("\n  Press Enter to exit...")
+        sys.exit(1)
+
+    # Determine if input is a single file or a directory
+    if input_path.is_file():
+        if input_path.suffix.lower() not in supported_formats:
+            print(f"\n  [ERROR] Unsupported format: {input_path.suffix}")
+            _pause_exit("\n  Press Enter to exit...")
+            sys.exit(1)
+        image_files = [input_path]
+        input_dir = input_path.parent
+    else:
+        input_dir = input_path
+        image_files = [f for f in input_dir.rglob('*')
+                       if f.is_file() and f.suffix.lower() in supported_formats]
+
+    # Output directory
+    output_dir = args.output if args.output else exe_dir / "output"
+    try:
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"\n  [ERROR] Cannot access/create folders: {e}")
+        print("         Try a writable location (not protected by OneDrive/Windows Security).")
+        _pause_exit("\n  Press Enter to exit...")
+        sys.exit(1)
+
+    print(f"\n  [DIR] Input:  {input_dir}")
+    print(f"  [DIR] Output: {output_dir}")
+    print(f"  Supported formats: JPG, PNG, WebP, HEIC")
     
     if not image_files:
-        print("\n[!] No images found in input folder.")
-        print("    Place images in: input/")
-        print("\nSupported formats: JPG, PNG, WebP, HEIC")
+        print("\n  [!] No images found.")
+        print("      Place images or subfolders in the input path.")
+        _pause_exit("\n  Press Enter to exit...")
         sys.exit(1)
     
-    print(f"\n[SCAN] Found {len(image_files)} image(s)")
+    print(f"\n  [SCAN] Found {len(image_files)} image(s)")
+
+    # Pre-load AI model once before the batch loop
+    print("")
+    _get_rembg_session()
     
     # Process with progress
     total_start = time.time()
@@ -1530,14 +1821,12 @@ def main():
     results = []
     
     for idx, image_path in enumerate(image_files, 1):
-        # Progress bar (ASCII compatible)
         percent = (idx / total) * 100
         bar_len = 25
         filled = int(bar_len * idx / total)
         bar = '#' * filled + '-' * (bar_len - filled)
         print(f"\n[{bar}] {percent:.0f}% ({idx}/{total})")
         
-        # Calculate output folder (maintain structure)
         try:
             rel_path = image_path.relative_to(input_dir)
             target_out = output_dir / rel_path.parent
@@ -1563,14 +1852,16 @@ def main():
     print("\n" + "="*60)
     print("  Done! Images ready for Carousell upload.")
     print("="*60 + "\n")
-    
-    # Generate comparisons if requested
-    if args.compare:
-        comparison_dir = script_dir / "comparisons"
-        generate_all_comparisons(results, comparison_dir)
-    else:
-        print("\n[INFO] Run with --compare to generate side-by-side comparisons")
+
+    _pause_exit("  Press Enter to exit...")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        print("\n[FATAL] Unhandled error:")
+        traceback.print_exc()
+        _pause_exit("\n  Press Enter to exit...")
+        sys.exit(1)

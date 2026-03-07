@@ -8,6 +8,12 @@ input/
 output/
 output_test/
 comparisons/
+test_input/
+test_output/
+dist/
+build/
+.u2net/
+.numba_cache/
 
 # OS
 Thumbs.db

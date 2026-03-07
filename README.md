@@ -1,124 +1,139 @@
-# Carousell Image Cropper (Local)
+# MisterMobile - Carousell Image Cropper (Local/Windows)
 
-Automated image processing for Carousell listings with AI-first object detection, white-platform constrained crop, and 1080×1080 output.
+Automated product photo processing for Carousell listings.
 
-## Key Features
+This README is aligned with `data-carocrop-local/processor.py` as currently configured.
 
-1. **AI-First Detection** — U2-Net (`rembg`) with mask dilation for robust edge detection.
-2. **Lab-Based CV Fallback** — Lab L-channel + Otsu thresholding + morphology when AI fails.
-3. **Mask Dilation** — 3px elliptical dilation fuses fragile device edges before contour extraction, preventing wrong-object detection.
-4. **Light-Box Strategy** — Border margin exclusion (5% extreme, 8% side) with center-biased contour scoring.
-5. **White Platform Constraint** — Crop is constrained to the detected white platform area.
-6. **Yellow Logo Inclusion** — Yellow mascot/logo is always included in crop bounds when detected.
-7. **Artifact-Aware Padding** — 6% padding around detected product, with per-side contamination probes that halve padding if artifacts (paper, backdrop) are detected in the outer zone.
-8. **Smart Square Crop** — Final output is always 1:1 (1080×1080) with priority: full product in frame > maximum coverage.
-9. **Adaptive Enhancement** — Dynamic brightness/contrast/sharpness based on image analysis.
-10. **Backdrop Brightening** — Selective backdrop brightening while preserving product colors.
-11. **Padding-Preserving Border Cleanup** — Post-crop symmetrical trimming capped at 2% to protect padding.
-12. **Comparison Mode** — Side-by-side input/output images for visual QC (`--compare`).
-13. **Recursive Scanning** — Processes all supported images in subfolders.
-14. **HEIC Support** — iPhone HEIC/HEIF support via `pillow-heif`.
-15. **MM Watermark** — Watermark asset included (`MM Watermark.png`) for future implementation.
+## Current Behavior
+
+- AI-first object detection and smart square crop (with CV fallback)
+- Output is always `1080x1080` PNG
+- Watermark is applied from `MM Watermark.png`
+- Backdrop normalization code exists, but is disabled by default:
+  - `ENABLE_BACKDROP_NORMALIZATION = False`
+- Brightness is handled as full-frame enhancement with adaptive targeting:
+  - `GLOBAL_BRIGHTNESS = 1.16`
+  - `ENABLE_ADAPTIVE_BRIGHTNESS_TARGET = True`
+  - Target luma and clamp limits are applied per image
+- Anti-gray correction is enabled:
+  - White-point lift (Lab L channel)
+  - Mild color boost
 
 ## Processing Pipeline
 
-```text
-Load → AI Detection (U2-Net + mask dilation) → [Lab-based CV Fallback]
-→ Filter AI Components → White Platform Detection → Logo Merge
-→ Artifact-Aware Padding → Square Crop Solve → Border Cleanup (2% cap)
-→ Backdrop Brighten → Adaptive Enhance → Resize 1080×1080 → Save
-```
+Load -> AI detection (U2-Net) -> component filtering -> platform detection
+-> logo check -> square crop -> border cleanup
+-> optional localized backdrop normalization (off by default)
+-> global enhancement (brightness/contrast/sharpness)
+-> anti-gray correction (white-point + color)
+-> resize 1080x1080 -> watermark -> save PNG
 
-## Quick Start
+## Brightness and Color Tuning
+
+Primary controls (top of `processor.py`):
+
+- `ENABLE_BACKDROP_NORMALIZATION` (bool)
+- `GLOBAL_BRIGHTNESS` (float)
+- `ENABLE_ADAPTIVE_BRIGHTNESS_TARGET` (bool)
+- `ADAPTIVE_BRIGHTNESS_TARGET_LUMA` (float)
+- `ADAPTIVE_BRIGHTNESS_STRENGTH` (float)
+- `ADAPTIVE_BRIGHTNESS_MIN` / `ADAPTIVE_BRIGHTNESS_MAX` (float clamp)
+- `ENABLE_ANTI_GRAY_CORRECTION` (bool)
+- `WHITE_POINT_PERCENTILE` (float)
+- `WHITE_POINT_TARGET_LUMA` (float)
+- `WHITE_POINT_MAX_GAIN` (float)
+- `GLOBAL_COLOR_BOOST` (float)
+
+Quick guidance:
+
+- Too dark: increase `ADAPTIVE_BRIGHTNESS_TARGET_LUMA` first
+- Too flat or gray: increase `WHITE_POINT_TARGET_LUMA` slightly, then `GLOBAL_COLOR_BOOST`
+- Too bright/washed: reduce `GLOBAL_BRIGHTNESS` or lower `ADAPTIVE_BRIGHTNESS_MAX`
+
+## Run and Build (Windows)
+
+Python version is pinned to `3.12` for runtime stability with the compiled build.
+`build.bat` and `run_local.bat` will stop with an error if the venv is not 3.12.
 
 ```powershell
-# From this folder
+# Create/recreate 3.12 venv
+py -3.12 -m venv venv
+
+# Install dependencies
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# Run locally
 run_local.bat
+# or
+.\venv\Scripts\python.exe processor.py
+
+# Build stable app folder
+build.bat
+
+# Optional: experimental onefile build
+build_onefile_experimental.bat
+
+# Optional: PyInstaller fallback build
+build_pyinstaller.bat
 ```
 
-## Folder Structure
+Build output:
 
 ```text
-data-carocrop-local/
-├── input/           # Raw photos (JPG, JPEG, PNG, WebP, HEIC, HEIF) [gitignored]
-├── output/          # Processed outputs (1080×1080 PNG) [gitignored]
-├── comparisons/     # Side-by-side QC comparisons [gitignored]
-├── processor.py     # Main processing pipeline
-├── run_local.bat    # Local batch launcher (with --compare)
-├── requirements.txt # Python dependencies
-├── MM Watermark.png # Watermark asset (for future use)
-├── .gitignore       # Git ignore rules
-└── README.md        # This file
+dist/
+  MisterMobileCropper-v3.dist/
+    MisterMobileCropper-v3.exe
+    MM Watermark.png
+    INSTRUCTIONS.html
+    .u2net/
+      u2net.onnx
+    input/
+    output/
 ```
 
-## Tunable Constants
+`build.bat` now targets a stable standalone build.
+`build_onefile_experimental.bat` is kept only for onefile testing.
 
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `TARGET_SIZE` | 1080 | Output dimensions (1080×1080) |
-| `DEFAULT_PADDING_PCT` | 0.06 (6%) | Breathing room around detected product |
-| `AI_MASK_DILATE_PX` | 3 | Dilation kernel radius for AI mask |
-| `PADDING_ARTIFACT_THRESHOLD` | 0.50 | Contamination score before padding is halved |
-| `PLATFORM_X_TRIM_PCT` | 0.05 | X-margin trimmed from white platform |
-| `PLATFORM_Y_TRIM_PCT` | 0.03 | Y-margin trimmed from white platform |
+PyInstaller fallback output:
 
-## CLI Usage
-
-```powershell
-python processor.py [--input PATH] [--output PATH] [--compare]
+```text
+dist/
+  pyinstaller/
+    MisterMobileCropper-v3/
+      MisterMobileCropper-v3.exe
+      MM Watermark.png
+      INSTRUCTIONS.html
+      .u2net/
+        u2net.onnx
+      input/
+      output/
 ```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input` | `./input` | Input folder with raw photos |
-| `--output` | `./output` | Output folder for processed images |
-| `--compare` | off | Generate side-by-side comparisons in `comparisons/` |
 
 ## Output Specification
 
-| Property | Value |
-|----------|-------|
-| Format | PNG |
-| Size | 1080×1080 |
-| Aspect Ratio | 1:1 |
-| Filename | `{original}_caro.png` |
+- Format: PNG
+- Size: `1080x1080`
+- Aspect ratio: `1:1`
+- Filename: `{original_name}.png`
 
-## Cropping Rules
+## Folder Layout
 
-- **Full product in frame** — never cut off if geometrically possible.
-- **6% padding** — visible breathing room on all sides (halved if artifacts detected).
-- **Edge artifacts always trimmed** — even if they clip the product edges.
-- **Yellow logo included** — always merged into required bounds when detected.
-- **Minimum zoom floor** — crop is at least 50% of the image's shorter dimension.
-
-## Logging Tags
-
-| Tag | Description |
-|-----|-------------|
-| `[AI-FIRST]` | AI detection and CV fallback status |
-| `[AI-COMPONENT]` | Component filtering (kept/dropped with scores) |
-| `[PLATFORM]` | Detected white-platform bounds |
-| `[LOGO]` | Yellow mascot/logo detection |
-| `[PAD-GUARD]` | Per-side artifact probe results and padding adjustments |
-| `[CROP-SOLVER]` | Crop solve decisions and square sizing |
-| `[BORDER-CLEANUP]` | Post-crop edge trimming results |
-| `[CONSTRAINT-CONFLICT]` | Conflict between required bounds and platform |
-
-## Installation
-
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate
-pip install -r requirements.txt
+```text
+data-carocrop-local/
+  processor.py
+  build.bat
+  build_onefile_experimental.bat
+  build_pyinstaller.bat
+  run_local.bat
+  requirements.txt
+  MM Watermark.png
+  INSTRUCTIONS.html
+  input/
+  output/
+  dist/
+  README.md
 ```
 
-## Dependencies
+## Note About macOS Folder
 
-| Package | Purpose |
-|---------|---------|
-| `pillow` | Image processing |
-| `pillow-heif` | HEIC/HEIF support |
-| `numpy` | Array operations |
-| `opencv-python` | CV detection, Lab color space, morphology |
-| `rembg` | AI saliency detection (U2-Net) |
-| `onnxruntime` | ONNX model runtime for rembg |
+`data-carocrop-mac/processor.py` is now synced with this local version.

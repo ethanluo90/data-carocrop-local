@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MisterMobile Image Cropper — User Guide</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', Tahoma, Geneva, sans-serif; background: #f5f5f5; color: #333; line-height: 1.6; }
+  .container { max-width: 800px; margin: 0 auto; padding: 30px 40px; background: #fff; min-height: 100vh; }
+  h1 { color: #1a1a2e; font-size: 28px; margin-bottom: 8px; }
+  .subtitle { color: #666; font-size: 16px; margin-bottom: 30px; }
+  h2 { color: #16213e; font-size: 22px; margin-top: 36px; margin-bottom: 14px; padding-bottom: 6px; border-bottom: 2px solid #e8e8e8; }
+  h3 { color: #0f3460; font-size: 17px; margin-top: 22px; margin-bottom: 10px; }
+  p { margin-bottom: 12px; }
+  ul { margin: 8px 0 14px 24px; }
+  li { margin-bottom: 6px; }
+  ol { margin: 8px 0 14px 24px; }
+  ol li { margin-bottom: 8px; }
+  code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-family: 'Consolas', 'Courier New', monospace; font-size: 14px; }
+  pre { background: #1e1e2e; color: #cdd6f4; padding: 16px 20px; border-radius: 8px; overflow-x: auto; margin: 12px 0 16px 0; font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; line-height: 1.5; }
+  .folder-box { background: #f0f7ff; border: 1px solid #b8d4f0; border-radius: 8px; padding: 18px 22px; margin: 14px 0; }
+  .folder-box pre { background: #1e1e2e; margin: 10px 0 0 0; }
+  .tip-table { width: 100%; border-collapse: collapse; margin: 14px 0; }
+  .tip-table th { background: #16213e; color: #fff; padding: 10px 14px; text-align: left; font-size: 14px; }
+  .tip-table td { padding: 10px 14px; border-bottom: 1px solid #eee; font-size: 14px; }
+  .tip-table tr:nth-child(even) { background: #f9f9f9; }
+  .tip-label { font-weight: 600; color: #0f3460; white-space: nowrap; }
+  .trouble-item { background: #fff8f0; border-left: 4px solid #e6a23c; padding: 12px 16px; margin: 10px 0; border-radius: 0 6px 6px 0; }
+  .trouble-item strong { color: #c0392b; }
+  .trouble-item .fix { color: #27ae60; font-weight: 500; }
+  .step-num { display: inline-block; background: #0f3460; color: #fff; width: 28px; height: 28px; border-radius: 50%; text-align: center; line-height: 28px; font-size: 14px; font-weight: 700; margin-right: 8px; }
+  .pipeline { background: #f0fff0; border: 1px solid #b8e6b8; border-radius: 8px; padding: 16px 20px; margin: 14px 0; }
+  .pipeline ol { margin-left: 20px; }
+  .pipeline li { margin-bottom: 6px; }
+  hr { border: none; border-top: 1px solid #e8e8e8; margin: 28px 0; }
+  .highlight { background: #fff3cd; padding: 2px 4px; border-radius: 2px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>MisterMobile Image Cropper</h1>
+<p class="subtitle">A simple tool that automatically crops and enhances your product photos for Carousell.<br>Just put your photos in, double-click, and get perfect 1080&times;1080 images out.<br>Works on <strong>Windows</strong> and <strong>macOS</strong>.</p>
+
+<hr>
+
+<h2>What You Get</h2>
+<div class="folder-box">
+  <p><strong>Windows</strong> — your folder should look like this:</p>
+  <pre>&#128193; MisterMobileCropper/
+   ├── MisterMobileCropper-v3.exe    &larr; The program (double-click this)
+   ├── MM Watermark.png              &larr; Watermark image (don't delete!)
+   ├── INSTRUCTIONS.html             &larr; This guide
+   ├── input/                        &larr; Put your photos here
+   └── output/                       &larr; Your cropped photos appear here</pre>
+</div>
+<div class="folder-box">
+  <p><strong>macOS</strong> — your folder should look like this:</p>
+  <pre>&#128193; MisterMobileCropper/
+   ├── MisterMobileCropper.app       &larr; The app (double-click this)
+   ├── MM Watermark.png              &larr; Watermark image (don't delete!)
+   ├── INSTRUCTIONS.html             &larr; This guide
+   ├── input/                        &larr; Put your photos here
+   └── output/                       &larr; Your cropped photos appear here</pre>
+  <p style="margin-top:10px; color:#856404; font-size:13px;">&#9888; First time opening on Mac? Right-click the .app &rarr; click <strong>Open</strong> to bypass Gatekeeper.</p>
+</div>
+
+<hr>
+
+<h2>Step-by-Step Guide</h2>
+
+<h3><span class="step-num">1</span> Put Your Photos In</h3>
+<p>Copy your product photos into the <strong>input</strong> folder.</p>
+<ul>
+  <li>You can put photos directly in <code>input/</code>, or organize them in subfolders.</li>
+  <li>Supported formats: <strong>JPG, JPEG, PNG, WebP, HEIC</strong> (iPhone photos)</li>
+  <li>You can put as many photos as you want — the tool processes them all.</li>
+</ul>
+<p><strong>Example:</strong></p>
+<pre>input/
+   ├── iPhone 15 Pro/
+   │     ├── photo1.jpg
+   │     ├── photo2.jpg
+   │     └── photo3.heic
+   └── Galaxy S24/
+         ├── front.png
+         └── back.png</pre>
+
+<h3><span class="step-num">2</span> Run the Program</h3>
+<p><strong>Windows:</strong> Double-click <strong>MisterMobileCropper-v3.exe</strong>.</p>
+<p><strong>macOS:</strong> Double-click <strong>MisterMobileCropper.app</strong>. (First time? Right-click &rarr; Open.)</p>
+<p>A console window will open. Just press <strong>Enter</strong> when it asks for a path — it will automatically use the <code>input/</code> folder.</p>
+<pre>  Drag &amp; drop a folder or image here, then press Enter.
+  Or just press Enter to use the default ./input folder.
+
+  Path: &larr; just press Enter</pre>
+
+<h3><span class="step-num">3</span> Wait for Processing</h3>
+<p>The tool will show a progress bar as it processes each image:</p>
+<pre>[#############------------] 52% (5/10)
+
+==================================================
+Processing: photo1.jpg
+==================================================
+  -&gt; Loading image...
+  -&gt; Tight cropping to object...
+  -&gt; Normalizing backdrop...
+  -&gt; Enhancing image...
+  -&gt; Resizing to 1080x1080...
+  -&gt; Applying MM watermark...
+  -&gt; Saving: photo1.png
+  [OK] Complete! (3.2s)</pre>
+<p>If any photo fails, it <strong>won't stop</strong> — it skips the problem photo and continues with the rest. At the end you'll see a summary:</p>
+<pre>  [+] Processed: 9
+  [-] Failed:    1</pre>
+
+<h3><span class="step-num">4</span> Get Your Results</h3>
+<p>Open the <strong>output</strong> folder. Your cropped photos are there, ready to upload to Carousell.</p>
+<ul>
+  <li>All photos are saved as <strong>PNG</strong> files at <strong>1080&times;1080</strong> pixels.</li>
+  <li>Subfolder structure is preserved (e.g., <code>output/iPhone 15 Pro/photo1.png</code>).</li>
+  <li>The MisterMobile watermark is automatically added.</li>
+</ul>
+
+<h3><span class="step-num">5</span> Upload to Carousell</h3>
+<p>Select all photos from <code>output/</code> and upload them directly to your Carousell listing. They're already the perfect size and format.</p>
+
+<hr>
+
+<h2>Alternative: Drag &amp; Drop a Folder</h2>
+<p>Instead of using the default <code>input/</code> folder, you can drag any folder directly onto the console window:</p>
+<ol>
+  <li>Double-click the .exe (Windows) or .app (macOS)</li>
+  <li>When it asks for a path, <strong>drag a folder from File Explorer / Finder</strong> into the console window</li>
+  <li>Press Enter</li>
+</ol>
+<p>This is handy if your photos are on a USB drive or somewhere else.</p>
+
+<hr>
+
+<h2>Tips</h2>
+<table class="tip-table">
+  <tr><th>Tip</th><th>Details</th></tr>
+  <tr><td class="tip-label">Best photo background</td><td>White or light-colored background works best</td></tr>
+  <tr><td class="tip-label">Clear the input folder</td><td>Delete old photos before adding new ones to avoid reprocessing</td></tr>
+  <tr><td class="tip-label">Keep the watermark file</td><td><code>MM Watermark.png</code> must stay next to the .exe / .app — without it, no watermark is applied</td></tr>
+  <tr><td class="tip-label">Check failed photos</td><td>If a photo fails, it might be corrupted or an unsupported format</td></tr>
+  <tr><td class="tip-label">First run is slower</td><td>The AI model loads on first use — subsequent photos in the same batch are faster</td></tr>
+</table>
+
+<hr>
+
+<h2>Troubleshooting</h2>
+
+<div class="trouble-item">
+  <strong>"No images found"</strong><br>
+  <span class="fix">→ Make sure your photos are inside the <code>input/</code> folder (not in a deeper nested folder you didn't expect).</span>
+</div>
+
+<div class="trouble-item">
+  <strong>Photos look the same / not cropped</strong><br>
+  <span class="fix">→ The tool needs a product on a background to detect. Plain flat-lay photos with no distinct object may not crop well.</span>
+</div>
+
+<div class="trouble-item">
+  <strong>Watermark is missing</strong><br>
+  <span class="fix">→ Check that <code>MM Watermark.png</code> is in the same folder as the .exe / .app.</span>
+</div>
+
+<div class="trouble-item">
+  <strong>The program closes immediately (Windows)</strong><br>
+  <span class="fix">→ Try running from Command Prompt instead: open <code>cmd</code>, navigate to the folder, and type <code>MisterMobileCropper-v3.exe</code>. This way you can see any error messages.</span>
+</div>
+
+<div class="trouble-item">
+  <strong>"App is damaged" or won't open (macOS)</strong><br>
+  <span class="fix">→ Right-click the .app → click <strong>Open</strong>. macOS blocks unsigned apps by default — this bypasses Gatekeeper for this app only.</span>
+</div>
+
+<div class="trouble-item">
+  <strong>"Path not found" error</strong><br>
+  <span class="fix">→ Make sure the path you entered/dragged exists and doesn't have special characters.</span>
+</div>
+
+<hr>
+
+<h2>What the Tool Does to Your Photos</h2>
+<div class="pipeline">
+  <ol>
+    <li><strong>Detects your product</strong> using AI (removes background clutter from crop)</li>
+    <li><strong>Crops tightly</strong> around the product with a small padding</li>
+    <li><strong>Brightens the background</strong> to a clean, consistent white</li>
+    <li><strong>Enhances</strong> contrast and sharpness slightly</li>
+    <li><strong>Resizes</strong> to a perfect 1080&times;1080 square</li>
+    <li><strong>Adds</strong> the MisterMobile watermark</li>
+    <li><strong>Saves</strong> as a high-quality PNG</li>
+  </ol>
+</div>
+
+</div>
+</body>
+</html>
